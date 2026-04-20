@@ -133,6 +133,19 @@ function clampPrice(price: number, tickSize: string): number {
     return Math.max(t, Math.min(1 - t, price));
 }
 
+/**
+ * CLOB BUY "price" is a ceiling — must be ≥ best ask or FAK/FOK won't match.
+ * Uses live mid/BUY + BUY_SLIPPAGE_BPS, capped at 1 − tick (do NOT use 1 − target price for same-token inverse BUY).
+ */
+function buyCeilingFromLivePrice(currentPrice: number | null): number {
+    const tickNum = parseFloat(TICK_SIZE);
+    const hardCap = clampPrice(1 - tickNum, TICK_SIZE);
+    if (currentPrice === null || !(currentPrice > 0) || Number.isNaN(currentPrice)) return hardCap;
+    const slip = env.BUY_SLIPPAGE_BPS / 10000;
+    const padded = currentPrice * (1 + slip);
+    return clampPrice(Math.min(hardCap, padded), TICK_SIZE);
+}
+
 /** Prevents overlapping processTrade runs for the same on-chain fill id. */
 const tradeProcessLocks = new Set<string>();
 
@@ -428,7 +441,7 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
     if (tradeProcessLocks.has(lockKey)) return;
     tradeProcessLocks.add(lockKey);
     try {
-    if (!is5mOr15mCryptoMarket(trade)) {
+    if (env.COPY_TRADE_FILTER_CRYPTO_5M15M && !is5mOr15mCryptoMarket(trade)) {
         tradesSkipped++;
         logToFile(`SKIPPED: Not 5m/15m crypto market - ${trade.slug || trade.eventSlug || "N/A"}`);
         markTransactionAsSeen(transactionHash, conditionId, tokenId);
@@ -464,7 +477,6 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
     }
 
     const price = trade.price || 0;
-    const t = parseFloat(TICK_SIZE);
     let tokenForBuy: string | null = copySide === "BUY" ? tokenId : null;
     let hedgeBuy = false;
 
@@ -477,8 +489,24 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
         const sourceWalletDisplay = sourceWallet ? ` [${sourceWallet.substring(0, 6)}...${sourceWallet.substring(38)}]` : "";
         logToFile(`INVERSE_COPY sourceSide=${sourceSide} copySide=${copySide} tokenId=${tokenId.substring(0, 14)}...`);
 
+        let sourceBookPrice: number;
+        if (price > 0) {
+            sourceBookPrice = clampPrice(price, TICK_SIZE);
+        } else {
+            const qSide = sourceSide === "BUY" ? ("BUY" as const) : ("SELL" as const);
+            const pr = await client.getPrice(tokenId, qSide).catch(() => null);
+            const parsed = parsePriceFromResponse(pr);
+            sourceBookPrice =
+                parsed !== null && parsed > 0 ? clampPrice(parsed, TICK_SIZE) : clampPrice(0.5, TICK_SIZE);
+        }
+        /** Mirror book for SELL only: target bought at p → we sell same token with floor 1−p (binary complement). */
+        const inverseSellMirrorPrice = clampPrice(1 - sourceBookPrice, TICK_SIZE);
+        logToFile(
+            `INVERSE_PRICE target ${sourceSide} @ ${sourceBookPrice.toFixed(4)} → SELL floor (1−p) ${inverseSellMirrorPrice.toFixed(4)} | BUY ceiling = live + ${env.BUY_SLIPPAGE_BPS}bps (capped 1−tick)`
+        );
+
         if (copySide === "SELL") {
-            const sellOrderPrice = clampPrice(t, TICK_SIZE);
+            const sellOrderPrice = inverseSellMirrorPrice;
             const sellBalance = await validateSellOrderBalance(client, tokenId, 0);
             if (sellBalance.available > 0) {
                 markTransactionAsSeen(transactionHash, conditionId, tokenId);
@@ -573,7 +601,6 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
             }
         }
 
-        const orderPriceBuy = clampPrice(1 - t, TICK_SIZE);
         const orderSizeTokens = env.ORDER_SIZE_IN_TOKENS ? configAmount! : undefined;
         let amountUsdc = 0;
         if (env.ORDER_SIZE_IN_TOKENS) {
@@ -654,10 +681,14 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
             return;
         }
 
+        const orderPriceBuy = buyCeilingFromLivePrice(currentPrice);
+
         console.log(
             `\n🟢 TRADE - BUY (inverse: source ${sourceSide}${hedgeBuy ? " hedge" : ""})${sourceWalletDisplay} | ${trade.title || trade.slug} | $${amountUsdc.toFixed(2)} USDC`
         );
-        console.log(`   CLOB price: ${currentPrice} (BUY_THRESHOLD: ${env.BUY_THRESHOLD})`);
+        console.log(
+            `   CLOB price: ${currentPrice} | BUY cap: ${orderPriceBuy.toFixed(4)} (live+slippage) | threshold: ${env.BUY_THRESHOLD}`
+        );
         console.log(`   [perf] validation→ready: ${Date.now() - t0}ms`);
 
         if (isTokenAlreadyBought(buyLegToken, sourceWallet)) {
@@ -741,7 +772,7 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
             console.log(
                 `✅ BUY | ${response.orderID || "N/A"} | ${tokensReceived.toFixed(2)} tokens @ ${buyLegToken.substring(0, 12)}... | processTrade: ${Date.now() - t0}ms`
             );
-            riskManagerStart(buyLegToken, conditionId, refPrice);
+            riskManagerStart(buyLegToken, conditionId, refPrice, getMarketResolutionMinutes(trade));
         } else {
             tradesFailed++;
             removeFromBoughtTokenIds(buyLegToken, sourceWallet);
@@ -789,8 +820,7 @@ async function executeBuyFromPending(client: ClobClient, pending: PendingBuy, cu
         return true;
     }
     tokenIdsBuyInProgress.add(key);
-    const t = parseFloat(TICK_SIZE);
-    const orderPrice = clampPrice(1 - t, TICK_SIZE);
+    const orderPrice = buyCeilingFromLivePrice(currentPrice);
     const amountUsdc = env.ORDER_SIZE_IN_TOKENS
         ? Math.max(1, pending.configAmount * currentPrice)
         : Math.max(1, pending.configAmount);

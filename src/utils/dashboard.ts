@@ -1,11 +1,15 @@
+import { inspect } from "util";
 import { getStats } from "../copy-trade/core";
 
 const MAX_EVENTS_STORED = 40;
+const MAX_CONSOLE_BUFFER = 400;
 
 interface EquityPoint {
     timestamp: number;
     value: number;
 }
+
+type ConsoleMethod = (...args: unknown[]) => void;
 
 class TerminalDashboard {
     private running = false;
@@ -13,14 +17,15 @@ class TerminalDashboard {
     private events: string[] = [];
     private equity: EquityPoint[] = [];
     private modeLabel = "LIVE";
-    private usedAltScreen = false;
+    private consoleBuffer: string[] = [];
+    private origConsole: { log: ConsoleMethod; error: ConsoleMethod; warn: ConsoleMethod } | null = null;
 
     start(modeLabel: string): void {
         if (!process.stdout.isTTY || this.running) return;
         this.running = true;
         this.modeLabel = modeLabel;
-        process.stdout.write("\x1B[?1049h\x1B[?25l");
-        this.usedAltScreen = true;
+        process.stdout.write("\x1B[?25l");
+        this.patchConsole();
         this.addEvent(`Dashboard started (${modeLabel})`);
         this.render();
         this.renderTimer = setInterval(() => this.render(), 1000);
@@ -30,12 +35,9 @@ class TerminalDashboard {
         if (this.renderTimer) clearInterval(this.renderTimer);
         this.renderTimer = null;
         this.running = false;
+        this.unpatchConsole();
         if (process.stdout.isTTY) {
             process.stdout.write("\x1B[?25h");
-            if (this.usedAltScreen) {
-                process.stdout.write("\x1B[?1049l");
-                this.usedAltScreen = false;
-            }
         }
     }
 
@@ -49,6 +51,54 @@ class TerminalDashboard {
         if (!Number.isFinite(value) || value < 0) return;
         this.equity.push({ timestamp: Date.now(), value });
         if (this.equity.length > 80) this.equity = this.equity.slice(-80);
+    }
+
+    private stripAnsi(s: string): string {
+        return s.replace(/\u001b\[[\d;?]*[ -/]*[@-~]/g, "");
+    }
+
+    private formatConsoleArgs(args: unknown[]): string {
+        return args
+            .map((a) => (typeof a === "string" ? a : inspect(a, { breakLength: 100, colors: false, depth: 3 })))
+            .join(" ");
+    }
+
+    private pushConsoleLine(raw: string): void {
+        const oneLine = this.stripAnsi(raw).replace(/\r?\n/g, " ").trim();
+        if (!oneLine) return;
+        const ts = new Date().toLocaleTimeString();
+        this.consoleBuffer.push(`${ts} | ${oneLine}`);
+        if (this.consoleBuffer.length > MAX_CONSOLE_BUFFER) {
+            this.consoleBuffer = this.consoleBuffer.slice(-MAX_CONSOLE_BUFFER);
+        }
+    }
+
+    private patchConsole(): void {
+        if (this.origConsole) return;
+        this.origConsole = {
+            log: console.log.bind(console) as ConsoleMethod,
+            error: console.error.bind(console) as ConsoleMethod,
+            warn: console.warn.bind(console) as ConsoleMethod,
+        };
+        const o = this.origConsole;
+        console.log = (...args: unknown[]) => {
+            this.pushConsoleLine(this.formatConsoleArgs(args));
+        };
+        console.warn = (...args: unknown[]) => {
+            this.pushConsoleLine(`WARN ${this.formatConsoleArgs(args)}`);
+        };
+        console.error = (...args: unknown[]) => {
+            this.pushConsoleLine(`ERR ${this.formatConsoleArgs(args)}`);
+            o.error(...args);
+        };
+    }
+
+    private unpatchConsole(): void {
+        if (!this.origConsole) return;
+        console.log = this.origConsole.log;
+        console.error = this.origConsole.error;
+        console.warn = this.origConsole.warn;
+        this.origConsole = null;
     }
 
     private truncate(s: string, maxLen: number): string {
@@ -74,11 +124,28 @@ class TerminalDashboard {
         return out;
     }
 
+    private renderConsoleFooter(cols: number, maxLines: number): string[] {
+        const sep = "-".repeat(cols);
+        const head = this.truncate("* CONSOLE (stdout / stderr — newest at bottom)", cols);
+        const slot = Math.max(1, maxLines - 2);
+        const tail = this.consoleBuffer.slice(-slot);
+        const lines = tail.map((e) => this.truncate(e, cols));
+        while (lines.length < slot) lines.unshift("");
+        if (tail.length === 0 && this.consoleBuffer.length === 0 && slot > 0) {
+            lines[lines.length - 1] = this.truncate("(no console output yet)", cols);
+        }
+        return [sep, head, ...lines];
+    }
+
     private render(): void {
         if (!this.running) return;
 
-        const cols = Math.max(40, process.stdout.columns || 80);
         const rows = Math.max(18, process.stdout.rows || 24);
+        const cols = Math.max(40, process.stdout.columns || 80);
+        const consoleRows = Math.min(22, Math.max(6, Math.floor(rows * 0.28)));
+        const headerLines = 3;
+        const sepBeforeConsole = 1;
+        const bodyRows = Math.max(6, rows - headerLines - sepBeforeConsole - consoleRows);
 
         const stats = getStats();
         const now = new Date();
@@ -86,7 +153,6 @@ class TerminalDashboard {
         const topRule = "=".repeat(cols);
         const midRule = "-".repeat(cols);
 
-        const bodyRows = Math.max(10, rows - 5);
         const pnl = this.getPnlSummary();
         const tradesLine = `Trades  d:${stats.tradesDetected} c:${stats.tradesCopied} s:${stats.tradesSkipped} f:${stats.tradesFailed}`;
         const equityLine = `Equity  $${pnl.latest.toFixed(2)} (start $${pnl.start.toFixed(2)})  pnl ${pnl.delta >= 0 ? "+" : ""}$${pnl.delta.toFixed(2)} (${pnl.pct >= 0 ? "+" : ""}${pnl.pct.toFixed(2)}%)`;
@@ -98,8 +164,8 @@ class TerminalDashboard {
         let lines: string[];
         if (cols < minColsTwoPane) {
             const w = cols - 2;
-            const chartLines = this.renderEquityChartCompact(w, rows);
-            const ev = this.events.slice(-Math.max(6, bodyRows - 6));
+            const chartLines = this.renderEquityChartCompact(w, bodyRows);
+            const ev = this.events.slice(-Math.max(4, bodyRows - 8));
             const evBlock =
                 ev.length === 0
                     ? ["* EVENTS", "(no events yet)"]
@@ -117,8 +183,8 @@ class TerminalDashboard {
             const leftW = Math.max(22, Math.floor((cols - gutterLen) * 0.46));
             const rightW = cols - leftW - gutterLen;
 
-            const chartLines = this.renderEquityChartCompact(rightW, rows);
-            const eventSlots = Math.max(4, bodyRows - 1);
+            const chartLines = this.renderEquityChartCompact(rightW, bodyRows);
+            const eventSlots = Math.max(4, bodyRows - 2);
             const ev = this.events.slice(-eventSlots);
 
             const leftCol: string[] = ["* EVENTS (left)"];
@@ -140,6 +206,8 @@ class TerminalDashboard {
             const body = this.zipColumns(leftCol, rightCol, leftW, rightW, gutter);
             lines = [topRule, this.truncate(title, cols), midRule, ...body, midRule];
         }
+
+        lines.push(...this.renderConsoleFooter(cols, consoleRows));
 
         process.stdout.write("\x1B[2J\x1B[H");
         process.stdout.write(lines.join("\n") + "\n");

@@ -96,6 +96,14 @@ export const env = {
         return process.env.ENABLE_COPY_TRADING !== "false";
     },
 
+    /**
+     * When true (default), only process trades on 5m/15m crypto markets (slug/title rules).
+     * Set to false to allow inverse copy on any market Polymarket sends (still needs wallet in config.json).
+     */
+    get COPY_TRADE_FILTER_CRYPTO_5M15M(): boolean {
+        return process.env.COPY_TRADE_FILTER_CRYPTO_5M15M !== "false";
+    },
+
     /** Enable terminal dashboard UI while bot is running. */
     get ENABLE_TERMINAL_DASHBOARD(): boolean {
         return process.env.ENABLE_TERMINAL_DASHBOARD !== "false";
