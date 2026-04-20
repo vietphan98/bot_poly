@@ -1,8 +1,14 @@
 import { ApiKeyCreds, ClobClient, Chain } from "@polymarket/clob-client";
-import { writeFileSync, existsSync, readFileSync } from "fs";
+import { writeFileSync, existsSync } from "fs";
 import { resolve } from "path";
 import { Wallet } from "@ethersproject/wallet";
 import { env } from "../config/env";
+
+export const CREDENTIAL_JSON_PATH = resolve(process.cwd(), "src/data/credential.json");
+
+export function hasCredentialFile(): boolean {
+    return existsSync(CREDENTIAL_JSON_PATH);
+}
 
 export async function createCredential(): Promise<ApiKeyCreds | null> {
     const privateKey = env.PRIVATE_KEY;
@@ -31,6 +37,5 @@ export async function createCredential(): Promise<ApiKeyCreds | null> {
 }   
 
 export async function saveCredential(credential: ApiKeyCreds) {
-    const credentialPath = resolve(process.cwd(), "src/data/credential.json");
-    writeFileSync(credentialPath, JSON.stringify(credential, null, 2));
+    writeFileSync(CREDENTIAL_JSON_PATH, JSON.stringify(credential, null, 2));
 }

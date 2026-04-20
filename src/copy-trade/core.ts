@@ -159,6 +159,19 @@ async function fetchOppositeClobTokenId(conditionId: string, sourceTokenId: stri
     }
 }
 
+/** Gamma "other" token can be stale or unsettled — CLOB returns 404 for /price if no book. */
+async function clobHasOrderbookForToken(client: ClobClient, tokenId: string): Promise<boolean> {
+    try {
+        await client.getPrice(tokenId, "BUY");
+        return true;
+    } catch (err: unknown) {
+        const ax = err as { response?: { status?: number }; status?: number };
+        const st = ax?.response?.status ?? ax?.status;
+        if (st === 404) return false;
+        return true;
+    }
+}
+
 const CRYPTO_KEYWORDS = ["btc", "bitcoin", "eth", "ethereum", "xrp", "ripple", "sol", "solana"];
 
 export function isCryptoMarket(trade: { slug?: string; eventSlug?: string; title?: string }): boolean {
@@ -522,6 +535,17 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
                 tradesSkipped++;
                 logToFile(
                     `SKIPPED: inverse SELL — no ${tokenId.substring(0, 12)}... balance and could not resolve opposite outcome (Gamma)`
+                );
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                return;
+            }
+            if (!(await clobHasOrderbookForToken(client, opposite))) {
+                tradesSkipped++;
+                logToFile(
+                    `SKIPPED: inverse hedge — opposite token has no CLOB orderbook (404) ${opposite.substring(0, 14)}...`
+                );
+                console.log(
+                    `SKIPPED: hedge opposite token has no orderbook on CLOB (Gamma id may be stale). token=${opposite.substring(0, 20)}...`
                 );
                 markTransactionAsSeen(transactionHash, conditionId, tokenId);
                 return;

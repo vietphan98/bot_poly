@@ -6,7 +6,7 @@
  * Usage: npm run start
  */
 
-import { createCredential } from "./security/createCredential";
+import { createCredential, hasCredentialFile } from "./security/createCredential";
 import { approveUSDCAllowance, updateClobBalanceAllowance } from "./security/allowance";
 import { getRealTimeDataClient } from "./providers/wssProvider";
 import { getClobClient } from "./providers/clobclient";
@@ -61,7 +61,16 @@ async function main() {
     }
 
     loadProcessedTrades();
-    await createCredential();
+    if (!hasCredentialFile()) {
+        console.log("No src/data/credential.json — deriving CLOB API key once...");
+        const cred = await createCredential();
+        if (!cred) {
+            console.error("Failed to create credential. Check PRIVATE_KEY, CHAIN_ID (137 Polygon), and CLOB_API_URL.");
+            process.exit(1);
+        }
+    } else {
+        console.log("CLOB: using existing src/data/credential.json (delete file to force re-derive)");
+    }
 
     let clobClient: Awaited<ReturnType<typeof getClobClient>> | null = null;
     if (enableCopyTrading) {

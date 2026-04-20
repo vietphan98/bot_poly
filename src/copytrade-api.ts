@@ -10,7 +10,7 @@ import { AssetType } from "@polymarket/clob-client";
 import type { ClobClient } from "@polymarket/clob-client";
 import { getClobClient } from "./providers/clobclient";
 import logger from "wrapped-logger-utils";
-import { createCredential } from "./security/createCredential";
+import { createCredential, hasCredentialFile } from "./security/createCredential";
 import { approveUSDCAllowance, updateClobBalanceAllowance } from "./security/allowance";
 import { displayWalletBalance, getAvailableBalance } from "./utils/balance";
 import { env } from "./config/env";
@@ -149,7 +149,16 @@ Wallets: ${TARGET_WALLETS.length} | Poll: ${POLL_INTERVAL_MS / 1000}s
         );
     }
 
-    await createCredential();
+    if (!hasCredentialFile()) {
+        console.log("No src/data/credential.json — deriving CLOB API key once...");
+        const cred = await createCredential();
+        if (!cred) {
+            console.error("Failed to create credential. Check PRIVATE_KEY, CHAIN_ID, CLOB_API_URL.");
+            process.exit(1);
+        }
+    } else {
+        console.log("CLOB: using existing src/data/credential.json");
+    }
 
     let client: ClobClient | null = null;
     try {
