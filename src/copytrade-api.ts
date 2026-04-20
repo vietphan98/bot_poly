@@ -191,19 +191,24 @@ Wallets: ${TARGET_WALLETS.length} | Poll: ${POLL_INTERVAL_MS / 1000}s
         }
     }
 
-    try {
-        await approveUSDCAllowance();
-        if (client) await updateClobBalanceAllowance(client);
-        console.log("✅ Allowances set\n");
-    } catch (_) {
-        console.log("Allowances failed – will retry on first trade\n");
-    }
-
     console.log(`🎯 Polling every ${POLL_INTERVAL_MS / 1000}s...\n`);
     console.log(`🛡️ Risk manager: SELL_PRICE=${env.SELL_PRICE} (sell when price < this until next 5m mark)\n`);
 
     await pollAndProcessTrades();
     const pollInterval = setInterval(pollAndProcessTrades, POLL_INTERVAL_MS);
+
+    if (client) {
+        void (async () => {
+            try {
+                console.log("Background: USDC / CTF approvals (Polygon; may take 1–3 min)…");
+                await approveUSDCAllowance();
+                await updateClobBalanceAllowance(client);
+                console.log("✅ Background: allowances + CLOB sync complete\n");
+            } catch (_) {
+                console.log("Background: allowances failed — orders may fail until fixed / retried\n");
+            }
+        })();
+    }
     /** Pending BUY: when price was below threshold, check until price > BUY_THRESHOLD then buy. Risk manager: sell if price < SELL_PRICE. */
     const RISK_CHECK_MS = 200;
     const EQUITY_SAMPLE_MS = 5000;

@@ -24,8 +24,10 @@ import {
     loadProcessedTrades,
     getTargetWallets,
     getWalletOrderSize,
+    runPendingBuyCheck,
 } from "./copy-trade/core";
 import type { TradeForProcess } from "./copy-trade/core";
+import { runRiskCheck } from "./copy-trade/risk-manager";
 
 /** WS payload may use proxyWallet, wallet, or user — match config.json addresses. */
 function tradeWalletFromPayload(payload: TradePayload): string | undefined {
@@ -74,21 +76,15 @@ async function main() {
 
     let clobClient: Awaited<ReturnType<typeof getClobClient>> | null = null;
     if (enableCopyTrading) {
-        clobClient = await getClobClient();
-        await displayWalletBalance(clobClient);
         try {
-            const availableUsdc = await getAvailableBalance(clobClient, AssetType.COLLATERAL);
-            dashboard.pushEquity(availableUsdc);
-        } catch (_) {}
-        await approveUSDCAllowance();
-        await updateClobBalanceAllowance(clobClient);
-        if (env.ORDER_SIZE_IN_TOKENS) {
-            await refreshCachedAvailableUsdc(clobClient);
-            setInterval(async () => {
-                try {
-                    if (clobClient) await refreshCachedAvailableUsdc(clobClient);
-                } catch (_) {}
-            }, 150 * 1000);
+            clobClient = await getClobClient();
+            await displayWalletBalance(clobClient);
+            try {
+                const availableUsdc = await getAvailableBalance(clobClient, AssetType.COLLATERAL);
+                dashboard.pushEquity(availableUsdc);
+            } catch (_) {}
+        } catch (e) {
+            console.log(`CLOB init failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
@@ -158,6 +154,38 @@ async function main() {
     };
 
     getRealTimeDataClient({ onMessage, onConnect }).connect();
+    console.log("WebSocket started — listening for target trades (same as copytrade-api).\n");
+
+    /** On-chain approvals can take minutes; must not block WS or you see zero trades. */
+    if (enableCopyTrading && clobClient) {
+        void (async () => {
+            try {
+                console.log("Background: USDC / ConditionalTokens approvals (Polygon tx may take 1–3 min)…");
+                await approveUSDCAllowance();
+                await updateClobBalanceAllowance(clobClient);
+                console.log("Background: on-chain + CLOB allowance sync complete.");
+                if (env.ORDER_SIZE_IN_TOKENS) {
+                    await refreshCachedAvailableUsdc(clobClient);
+                    setInterval(async () => {
+                        try {
+                            await refreshCachedAvailableUsdc(clobClient);
+                        } catch (_) {}
+                    }, 150 * 1000);
+                }
+            } catch (e) {
+                console.log(
+                    `Background allowance failed (orders may fail until fixed): ${e instanceof Error ? e.message : String(e)}`
+                );
+            }
+        })();
+    }
+
+    const RISK_CHECK_MS = 200;
+    setInterval(() => {
+        void runPendingBuyCheck();
+        void runRiskCheck();
+    }, RISK_CHECK_MS);
+
     setInterval(async () => {
         if (!clobClient) return;
         try {
@@ -165,7 +193,6 @@ async function main() {
             dashboard.pushEquity(availableUsdc);
         } catch (_) {}
     }, 5000);
-    console.log("Bot running (WebSocket)\n");
 
     const shutdown = () => {
         dashboard.stop();
