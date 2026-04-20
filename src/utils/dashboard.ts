@@ -1,6 +1,6 @@
 import { getStats } from "../copy-trade/core";
 
-const MAX_EVENTS_STORED = 30;
+const MAX_EVENTS_STORED = 40;
 
 interface EquityPoint {
     timestamp: number;
@@ -19,8 +19,7 @@ class TerminalDashboard {
         if (!process.stdout.isTTY || this.running) return;
         this.running = true;
         this.modeLabel = modeLabel;
-        // Dedicated screen buffer so logs / other output do not overwrite the dashboard.
-        process.stdout.write("\x1B[?1049h");
+        process.stdout.write("\x1B[?1049h\x1B[?25l");
         this.usedAltScreen = true;
         this.addEvent(`Dashboard started (${modeLabel})`);
         this.render();
@@ -31,9 +30,12 @@ class TerminalDashboard {
         if (this.renderTimer) clearInterval(this.renderTimer);
         this.renderTimer = null;
         this.running = false;
-        if (this.usedAltScreen && process.stdout.isTTY) {
-            process.stdout.write("\x1B[?1049l");
-            this.usedAltScreen = false;
+        if (process.stdout.isTTY) {
+            process.stdout.write("\x1B[?25h");
+            if (this.usedAltScreen) {
+                process.stdout.write("\x1B[?1049l");
+                this.usedAltScreen = false;
+            }
         }
     }
 
@@ -50,59 +52,95 @@ class TerminalDashboard {
     }
 
     private truncate(s: string, maxLen: number): string {
+        if (maxLen <= 0) return "";
         if (s.length <= maxLen) return s;
         return s.slice(0, Math.max(0, maxLen - 1)) + "…";
+    }
+
+    private padCell(s: string, width: number): string {
+        const t = this.truncate(s, width);
+        return t.length >= width ? t : t + " ".repeat(width - t.length);
+    }
+
+    /** Zip two columns with a visible gutter so left/right never overlap. */
+    private zipColumns(left: string[], right: string[], leftW: number, rightW: number, gutter: string): string[] {
+        const n = Math.max(left.length, right.length);
+        const out: string[] = [];
+        for (let i = 0; i < n; i++) {
+            const L = this.padCell(left[i] ?? "", leftW);
+            const R = this.padCell(right[i] ?? "", rightW);
+            out.push(`${L}${gutter}${R}`);
+        }
+        return out;
     }
 
     private render(): void {
         if (!this.running) return;
 
         const cols = Math.max(40, process.stdout.columns || 80);
-        const rows = Math.max(15, process.stdout.rows || 24);
-        const width = Math.min(cols, 120);
-        const inner = Math.max(20, width - 2);
+        const rows = Math.max(18, process.stdout.rows || 24);
 
         const stats = getStats();
         const now = new Date();
-        const title = this.truncate(`POLYMARKET BOT DASHBOARD | ${this.modeLabel} | ${now.toLocaleTimeString()}`, inner);
-        const divider = "─".repeat(width);
+        const title = this.truncate(`POLYMARKET BOT DASHBOARD | ${this.modeLabel} | ${now.toLocaleTimeString()}`, cols);
+        const topRule = "=".repeat(cols);
+        const midRule = "-".repeat(cols);
 
-        // Reserve vertical space: events stay visible (not pushed below fold).
-        const reservedForHeader = 8;
-        const maxEventLines = Math.max(4, Math.min(12, rows - reservedForHeader));
-        const displayedEvents = this.events.slice(-maxEventLines);
-        const recent =
-            displayedEvents.length > 0
-                ? displayedEvents.map((e) => ` ${this.truncate(e, inner)}`).join("\n")
-                : " (no events yet)";
-
+        const bodyRows = Math.max(10, rows - 5);
         const pnl = this.getPnlSummary();
-        const tradesLine = this.truncate(
-            `Trades | detected: ${stats.tradesDetected} | copied: ${stats.tradesCopied} | skipped: ${stats.tradesSkipped} | failed: ${stats.tradesFailed}`,
-            inner
-        );
-        const equityLine = this.truncate(
-            `Equity | latest: $${pnl.latest.toFixed(2)} | start: $${pnl.start.toFixed(2)} | pnl: ${pnl.delta >= 0 ? "+" : ""}$${pnl.delta.toFixed(2)} (${pnl.pct >= 0 ? "+" : ""}${pnl.pct.toFixed(2)}%)`,
-            inner
-        );
+        const tradesLine = `Trades  d:${stats.tradesDetected} c:${stats.tradesCopied} s:${stats.tradesSkipped} f:${stats.tradesFailed}`;
+        const equityLine = `Equity  $${pnl.latest.toFixed(2)} (start $${pnl.start.toFixed(2)})  pnl ${pnl.delta >= 0 ? "+" : ""}$${pnl.delta.toFixed(2)} (${pnl.pct >= 0 ? "+" : ""}${pnl.pct.toFixed(2)}%)`;
 
-        const chartLines = this.renderEquityChartCompact(inner, rows);
-        const lines = [
-            divider,
-            ` ${title}`,
-            divider,
-            " RECENT EVENTS",
-            recent,
-            divider,
-            ` ${tradesLine}`,
-            ` ${equityLine}`,
-            divider,
-            " ASSET (USDC)",
-            ...chartLines.map((l) => ` ${this.truncate(l, inner)}`),
-            divider,
-        ];
+        const gutter = " | ";
+        const gutterLen = gutter.length;
+        const minColsTwoPane = 56;
 
-        // Clear visible buffer and home cursor (works reliably vs Form Feed on Windows).
+        let lines: string[];
+        if (cols < minColsTwoPane) {
+            const w = cols - 2;
+            const chartLines = this.renderEquityChartCompact(w, rows);
+            const ev = this.events.slice(-Math.max(6, bodyRows - 6));
+            const evBlock =
+                ev.length === 0
+                    ? ["* EVENTS", "(no events yet)"]
+                    : ["* EVENTS", ...ev.map((e) => this.truncate(e, w))];
+            const statBlock = [
+                "* STATS & USDC",
+                this.truncate(tradesLine, w),
+                this.truncate(equityLine, w),
+                "-",
+                "ASSET",
+                ...chartLines.map((l) => this.truncate(l, w)),
+            ];
+            lines = [topRule, this.truncate(title, cols), midRule, ...evBlock, midRule, ...statBlock, midRule];
+        } else {
+            const leftW = Math.max(22, Math.floor((cols - gutterLen) * 0.46));
+            const rightW = cols - leftW - gutterLen;
+
+            const chartLines = this.renderEquityChartCompact(rightW, rows);
+            const eventSlots = Math.max(4, bodyRows - 1);
+            const ev = this.events.slice(-eventSlots);
+
+            const leftCol: string[] = ["* EVENTS (left)"];
+            if (ev.length === 0) leftCol.push("(no events yet)");
+            else leftCol.push(...ev.map((e) => this.truncate(e, leftW)));
+
+            const rightCol: string[] = [
+                "* STATS / USDC (right)",
+                this.truncate(tradesLine, rightW),
+                this.truncate(equityLine, rightW),
+                "-",
+                "ASSET",
+                ...chartLines.map((l) => this.truncate(l, rightW)),
+            ];
+
+            while (leftCol.length < rightCol.length) leftCol.push("");
+            while (rightCol.length < leftCol.length) rightCol.push("");
+
+            const body = this.zipColumns(leftCol, rightCol, leftW, rightW, gutter);
+            lines = [topRule, this.truncate(title, cols), midRule, ...body, midRule];
+        }
+
         process.stdout.write("\x1B[2J\x1B[H");
         process.stdout.write(lines.join("\n") + "\n");
     }
@@ -116,22 +154,21 @@ class TerminalDashboard {
         return { start, latest, delta, pct };
     }
 
-    /** At most 2 short lines so events are not pushed off-screen. */
-    private renderEquityChartCompact(innerWidth: number, termRows: number): string[] {
-        if (this.equity.length === 0) return ["(no samples yet)"];
+    private renderEquityChartCompact(rightColWidth: number, termRows: number): string[] {
+        if (this.equity.length === 0) return ["(no samples)"];
         if (this.equity.length === 1) {
             const v = this.equity[0].value;
-            return [`$${v.toFixed(2)} USDC (chart after 2+ samples)`];
+            return [`$${v.toFixed(2)} (need 2+ pts)`];
         }
 
-        const maxChars = Math.max(24, Math.min(innerWidth, 56, termRows > 20 ? 56 : 40));
+        const maxChars = Math.max(16, Math.min(rightColWidth, 48, termRows > 22 ? 48 : 36));
         const points = this.equity.slice(-maxChars).map((p) => p.value);
         const min = Math.min(...points);
         const max = Math.max(...points);
         const blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
         if (max === min) {
-            return [`${"▅".repeat(Math.min(points.length, maxChars))}  flat @ $${min.toFixed(2)}`];
+            return [`${"▅".repeat(Math.min(points.length, maxChars))}`, `flat $${min.toFixed(2)}`];
         }
 
         const sparkline = points
@@ -144,7 +181,7 @@ class TerminalDashboard {
             })
             .join("");
 
-        return [sparkline, `min $${min.toFixed(2)}  max $${max.toFixed(2)}`];
+        return [this.truncate(sparkline, rightColWidth), `min ${min.toFixed(2)} max ${max.toFixed(2)}`];
     }
 }
 
