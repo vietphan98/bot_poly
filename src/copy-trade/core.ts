@@ -133,6 +133,32 @@ function clampPrice(price: number, tickSize: string): number {
     return Math.max(t, Math.min(1 - t, price));
 }
 
+/** Prevents overlapping processTrade runs for the same on-chain fill id. */
+const tradeProcessLocks = new Set<string>();
+
+/**
+ * Target bought token A but we have no A to SELL — for binary markets, buy the other outcome (Gamma clobTokenIds).
+ */
+async function fetchOppositeClobTokenId(conditionId: string, sourceTokenId: string): Promise<string | null> {
+    try {
+        const url = `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(conditionId)}`;
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        const arr: unknown = await r.json();
+        if (!Array.isArray(arr) || arr.length === 0) return null;
+        const m = arr[0] as Record<string, unknown>;
+        const raw = m.clobTokenIds;
+        if (raw == null) return null;
+        const ids: unknown = typeof raw === "string" ? JSON.parse(raw as string) : raw;
+        if (!Array.isArray(ids) || ids.length < 2) return null;
+        const src = String(sourceTokenId);
+        const other = ids.map((x) => String(x)).find((id) => id !== src);
+        return other ?? null;
+    } catch {
+        return null;
+    }
+}
+
 const CRYPTO_KEYWORDS = ["btc", "bitcoin", "eth", "ethereum", "xrp", "ripple", "sol", "solana"];
 
 export function isCryptoMarket(trade: { slug?: string; eventSlug?: string; title?: string }): boolean {
@@ -385,6 +411,10 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
 
     if (isProcessed(transactionHash, conditionId, tokenId)) return;
 
+    const lockKey = getTradeId(transactionHash, conditionId, tokenId);
+    if (tradeProcessLocks.has(lockKey)) return;
+    tradeProcessLocks.add(lockKey);
+    try {
     if (!is5mOr15mCryptoMarket(trade)) {
         tradesSkipped++;
         logToFile(`SKIPPED: Not 5m/15m crypto market - ${trade.slug || trade.eventSlug || "N/A"}`);
@@ -413,40 +443,122 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
         return;
     }
     const configAmount = WALLET_ORDER_SIZE[sourceWallet.toLowerCase()];
-    if (copySide === "BUY" && (configAmount == null || configAmount <= 0)) {
+    const needsConfigForBuy = copySide === "BUY" || sourceSide === "BUY";
+    if (needsConfigForBuy && (configAmount == null || configAmount <= 0)) {
         tradesSkipped++;
         logToFile(`SKIPPED: No order amount for wallet ${sourceWallet}`);
         return;
     }
-    markTransactionAsSeen(transactionHash, conditionId, tokenId);
-    if (copySide === "BUY") tokenIdsBuyInProgress.add(buyInProgressKey);
-    void notifyTelegramTargetTrade(trade);
 
     const price = trade.price || 0;
     const t = parseFloat(TICK_SIZE);
-    // Aggressive prices to prioritize fill: BUY at max (1-tick), SELL at min (tick)
-    const orderPrice = copySide === "BUY" ? clampPrice(1 - t, TICK_SIZE) : clampPrice(t, TICK_SIZE);
-    // config.json value: ORDER_SIZE_IN_TOKENS=true → token amount; else → fixed USDC
-    const orderSizeTokens = copySide === "BUY" && env.ORDER_SIZE_IN_TOKENS ? configAmount! : undefined;
-    let amountUsdc = 0;
-    if (copySide === "BUY") {
-        if (env.ORDER_SIZE_IN_TOKENS) {
-            amountUsdc = Math.max(1, configAmount! * price);
-        } else {
-            // ORDER_SIZE_IN_TOKENS=false: config value = fixed USDC amount
-            amountUsdc = Math.max(1, configAmount!);
-        }
-    }
+    let tokenForBuy: string | null = copySide === "BUY" ? tokenId : null;
+    let hedgeBuy = false;
 
     const t0 = Date.now();
     try {
         const client = await getClobClient();
         console.log(`   [perf] getClobClient: ${Date.now() - t0}ms`);
+        void notifyTelegramTargetTrade(trade);
 
         const sourceWalletDisplay = sourceWallet ? ` [${sourceWallet.substring(0, 6)}...${sourceWallet.substring(38)}]` : "";
         logToFile(`INVERSE_COPY sourceSide=${sourceSide} copySide=${copySide} tokenId=${tokenId.substring(0, 14)}...`);
 
-        if (copySide === "BUY" && env.ORDER_SIZE_IN_TOKENS) {
+        if (copySide === "SELL") {
+            const sellOrderPrice = clampPrice(t, TICK_SIZE);
+            const sellBalance = await validateSellOrderBalance(client, tokenId, 0);
+            if (sellBalance.available > 0) {
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                const sellAmount = sellBalance.available;
+                const tOrderStart = Date.now();
+                const response: any = await retryWithBackoff(
+                    async () => {
+                        const marketOrder = {
+                            tokenID: tokenId,
+                            side: Side.SELL,
+                            amount: sellAmount,
+                            price: sellOrderPrice,
+                            orderType: ORDER_TYPE as OrderType.FOK | OrderType.FAK,
+                        };
+                        const result = await client.createAndPostMarketOrder(
+                            marketOrder,
+                            { tickSize: TICK_SIZE, negRisk: NEG_RISK },
+                            ORDER_TYPE
+                        );
+                        if (result && typeof result === "object") {
+                            if ((result as any).data?.error) throw new Error(`API Error: ${(result as any).data.error}`);
+                            if ((result as any).status === 400) throw new Error(`Bad Request: ${(result as any).data?.error || "Unknown"}`);
+                        }
+                        return result;
+                    },
+                    ORDER_RETRY_ATTEMPTS,
+                    ORDER_RETRY_DELAY_MS,
+                    `SELL ${sellAmount.toFixed(2)} tokens`
+                );
+                const isSuccess =
+                    response &&
+                    (response.status === "FILLED" ||
+                        response.status === "PARTIALLY_FILLED" ||
+                        response.status === "matched" ||
+                        response.status === "MATCHED" ||
+                        !response.status);
+                console.log(`   [perf] order placement: ${Date.now() - tOrderStart}ms`);
+                if (isSuccess) {
+                    tradesDetected++;
+                    tradesCopied++;
+                    removeFromBoughtTokenIds(tokenId, sourceWallet);
+                    markMarketAsSold(tokenId);
+                    try {
+                        removeHoldings(conditionId, tokenId, sellAmount);
+                    } catch (_) {}
+                    console.log(`✅ SELL | ${response.orderID || "N/A"} | ${sellAmount.toFixed(2)} tokens | processTrade: ${Date.now() - t0}ms`);
+                } else {
+                    tradesFailed++;
+                }
+                return;
+            }
+            const opposite = await fetchOppositeClobTokenId(conditionId, tokenId);
+            if (!opposite) {
+                tradesSkipped++;
+                logToFile(
+                    `SKIPPED: inverse SELL — no ${tokenId.substring(0, 12)}... balance and could not resolve opposite outcome (Gamma)`
+                );
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                return;
+            }
+            tokenForBuy = opposite;
+            hedgeBuy = true;
+            logToFile(`INVERSE_HEDGE: source BUY → BUY opposite token ${opposite.substring(0, 16)}...`);
+            if (isMarketAlreadySold(tokenForBuy)) {
+                tradesSkipped++;
+                logToFile(`SKIPPED: Opposite outcome market already sold - ${tokenForBuy.substring(0, 14)}...`);
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                return;
+            }
+            if (isTokenAlreadyBought(tokenForBuy, sourceWallet)) {
+                tradesSkipped++;
+                logToFile(`SKIPPED: Already bought opposite token - ${tokenForBuy.substring(0, 14)}...`);
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                return;
+            }
+            const hedgeKey = tokenWalletKey(tokenForBuy, sourceWallet);
+            if (tokenIdsBuyInProgress.has(hedgeKey)) {
+                tradesSkipped++;
+                logToFile(`SKIPPED: BUY in progress (hedge) - ${tokenForBuy.substring(0, 14)}...`);
+                return;
+            }
+        }
+
+        const orderPriceBuy = clampPrice(1 - t, TICK_SIZE);
+        const orderSizeTokens = env.ORDER_SIZE_IN_TOKENS ? configAmount! : undefined;
+        let amountUsdc = 0;
+        if (env.ORDER_SIZE_IN_TOKENS) {
+            amountUsdc = Math.max(1, configAmount! * price);
+        } else {
+            amountUsdc = Math.max(1, configAmount!);
+        }
+
+        if (env.ORDER_SIZE_IN_TOKENS) {
             const availableUsdc = await getAvailableBalance(client, AssetType.COLLATERAL);
             if (amountUsdc <= 0 || availableUsdc < amountUsdc) {
                 if (availableUsdc < amountUsdc) {
@@ -456,71 +568,25 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
                 }
             }
         }
-        if (copySide === "BUY" && amountUsdc <= 0) {
+        if (amountUsdc <= 0) {
             tradesSkipped++;
             logToFile(`SKIPPED: Invalid amount`);
             return;
         }
 
-        if (copySide === "SELL") {
-            const sellBalance = await validateSellOrderBalance(client, tokenId, 0);
-            if (sellBalance.available <= 0) {
-                tradesSkipped++;
-                logToFile(`SKIPPED: No token balance to SELL (inverse copy) - ${tokenId.substring(0, 14)}...`);
-                return;
-            }
-            const sellAmount = sellBalance.available;
-            const tOrderStart = Date.now();
-            const response: any = await retryWithBackoff(
-                async () => {
-                    const marketOrder = {
-                        tokenID: tokenId,
-                        side: Side.SELL,
-                        amount: sellAmount,
-                        price: orderPrice,
-                        orderType: ORDER_TYPE as OrderType.FOK | OrderType.FAK,
-                    };
-                    const result = await client.createAndPostMarketOrder(
-                        marketOrder,
-                        { tickSize: TICK_SIZE, negRisk: NEG_RISK },
-                        ORDER_TYPE
-                    );
-                    if (result && typeof result === "object") {
-                        if ((result as any).data?.error) throw new Error(`API Error: ${(result as any).data.error}`);
-                        if ((result as any).status === 400) throw new Error(`Bad Request: ${(result as any).data?.error || "Unknown"}`);
-                    }
-                    return result;
-                },
-                ORDER_RETRY_ATTEMPTS,
-                ORDER_RETRY_DELAY_MS,
-                `SELL ${sellAmount.toFixed(2)} tokens`
-            );
-            const isSuccess =
-                response &&
-                (response.status === "FILLED" ||
-                    response.status === "PARTIALLY_FILLED" ||
-                    response.status === "matched" ||
-                    response.status === "MATCHED" ||
-                    !response.status);
-            console.log(`   [perf] order placement: ${Date.now() - tOrderStart}ms`);
-            if (isSuccess) {
-                tradesDetected++;
-                tradesCopied++;
-                removeFromBoughtTokenIds(tokenId, sourceWallet);
-                markMarketAsSold(tokenId);
-                try {
-                    removeHoldings(conditionId, tokenId, sellAmount);
-                } catch (_) {}
-                console.log(`✅ SELL | ${response.orderID || "N/A"} | ${sellAmount.toFixed(2)} tokens | processTrade: ${Date.now() - t0}ms`);
-            } else {
-                tradesFailed++;
-            }
+        if (tokenForBuy === null) {
+            tradesSkipped++;
+            logToFile(`SKIPPED: No token for BUY leg (inverse SELL without hedge token)`);
             return;
         }
+        const buyLegToken = tokenForBuy;
+
+        const buyProgressKey = tokenWalletKey(buyLegToken, sourceWallet);
+        tokenIdsBuyInProgress.add(buyProgressKey);
 
         let currentPrice: number | null = null;
         try {
-            const priceResp = await client.getPrice(tokenId, "BUY");
+            const priceResp = await client.getPrice(buyLegToken, "BUY");
             if (typeof priceResp === "number" && !Number.isNaN(priceResp)) {
                 currentPrice = priceResp;
             } else if (typeof priceResp === "string") {
@@ -542,14 +608,14 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
             return;
         }
         if (currentPrice === null || currentPrice < env.BUY_THRESHOLD) {
-            const key = tokenWalletKey(tokenId, sourceWallet);
+            const key = tokenWalletKey(buyLegToken, sourceWallet);
             if (!pendingBuys.has(key)) {
                 const resolution = getMarketResolutionMinutes(trade);
                 const now = Date.now();
                 const windowEndMs = now + resolution * 60 * 1000;
                 const t = new Date(windowEndMs);
                 pendingBuys.set(key, {
-                    tokenId,
+                    tokenId: buyLegToken,
                     conditionId,
                     sourceWallet,
                     transactionHash,
@@ -557,20 +623,25 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
                     resolutionMinutes: resolution,
                     windowEndMs,
                 });
-                console.log(`📋 Pending BUY: tokenId ${tokenId.substring(0, 16)}... | ${resolution}m from now (until ${t.getHours()}:${String(t.getMinutes()).padStart(2, "0")}) | price ${currentPrice ?? "?"} < ${env.BUY_THRESHOLD} → will buy when price > threshold`);
-                logToFile(`PENDING_BUY: tokenId ${tokenId.substring(0, 20)}... price=${currentPrice} BUY_THRESHOLD=${env.BUY_THRESHOLD} resolution=${resolution}m`);
+                markTransactionAsSeen(transactionHash, conditionId, tokenId);
+                console.log(`📋 Pending BUY: tokenId ${buyLegToken.substring(0, 16)}... | ${resolution}m from now (until ${t.getHours()}:${String(t.getMinutes()).padStart(2, "0")}) | price ${currentPrice ?? "?"} < ${env.BUY_THRESHOLD} → will buy when price > threshold`);
+                logToFile(`PENDING_BUY: tokenId ${buyLegToken.substring(0, 20)}... price=${currentPrice} BUY_THRESHOLD=${env.BUY_THRESHOLD} resolution=${resolution}m`);
             }
             return;
         }
 
-        console.log(`\n🟢 TRADE - BUY (inverse: source ${sourceSide})${sourceWalletDisplay} | ${trade.title || trade.slug} | $${amountUsdc.toFixed(2)} USDC`);
+        console.log(
+            `\n🟢 TRADE - BUY (inverse: source ${sourceSide}${hedgeBuy ? " hedge" : ""})${sourceWalletDisplay} | ${trade.title || trade.slug} | $${amountUsdc.toFixed(2)} USDC`
+        );
         console.log(`   CLOB price: ${currentPrice} (BUY_THRESHOLD: ${env.BUY_THRESHOLD})`);
         console.log(`   [perf] validation→ready: ${Date.now() - t0}ms`);
 
-        if (isTokenAlreadyBought(tokenId, sourceWallet)) {
+        if (isTokenAlreadyBought(buyLegToken, sourceWallet)) {
             tradesSkipped++;
             return;
         }
+
+        markTransactionAsSeen(transactionHash, conditionId, tokenId);
 
         const orderOptions = { tickSize: TICK_SIZE, negRisk: NEG_RISK };
         let lastAttemptAmountUsdc = amountUsdc;
@@ -584,17 +655,17 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
                     lastAttemptAmountUsdc = amountUsdc;
                 } else if (orderSizeTokens != null && orderSizeTokens > 0) {
                     try {
-                        const currentPriceResp = await client.getPrice(tokenId, "BUY");
+                        const currentPriceResp = await client.getPrice(buyLegToken, "BUY");
                         const currentPriceRaw =
                             typeof currentPriceResp === "number"
                                 ? currentPriceResp
                                 : (currentPriceResp?.price ?? currentPriceResp?.mid ?? price);
-                        const currentPrice =
+                        const cpRound =
                             typeof currentPriceRaw === "number" && currentPriceRaw > 0
                                 ? clampPrice(currentPriceRaw, TICK_SIZE)
-                                : orderPrice;
-                        if (typeof currentPrice === "number" && currentPrice > 0) {
-                            orderAmountUsdc = Math.max(1, orderSizeTokens * currentPrice);
+                                : orderPriceBuy;
+                        if (typeof cpRound === "number" && cpRound > 0) {
+                            orderAmountUsdc = Math.max(1, orderSizeTokens * cpRound);
                             lastAttemptAmountUsdc = orderAmountUsdc;
                         }
                     } catch (_) {
@@ -602,10 +673,10 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
                     }
                 }
                 const marketOrder = {
-                    tokenID: tokenId,
+                    tokenID: buyLegToken,
                     side: Side.BUY,
                     amount: orderAmountUsdc,
-                    price: orderPrice,
+                    price: orderPriceBuy,
                     orderType: ORDER_TYPE as OrderType.FOK | OrderType.FAK,
                 };
                 const result = await client.createAndPostMarketOrder(marketOrder, orderOptions, ORDER_TYPE);
@@ -633,29 +704,35 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
         if (isSuccess) {
             tradesDetected++;
             tradesCopied++;
-            let tokensReceived = response.takingAmount ? parseFloat(response.takingAmount) : lastAttemptAmountUsdc / price;
+            const refPrice = currentPrice && currentPrice > 0 ? currentPrice : price;
+            let tokensReceived = response.takingAmount ? parseFloat(response.takingAmount) : lastAttemptAmountUsdc / refPrice;
             if (tokensReceived >= 1e6) tokensReceived = tokensReceived / 1e6;
-            const wasAlreadyBought = isTokenAlreadyBought(tokenId, sourceWallet);
+            const wasAlreadyBought = isTokenAlreadyBought(buyLegToken, sourceWallet);
             markAsProcessed(transactionHash, conditionId, tokenId, true, sourceWallet);
             if (!wasAlreadyBought) {
                 try {
-                    addHoldings(conditionId, tokenId, tokensReceived);
+                    addHoldings(conditionId, buyLegToken, tokensReceived);
                 } catch (_) {}
             }
-            console.log(`✅ BUY | ${response.orderID || "N/A"} | ${tokensReceived.toFixed(2)} tokens @ price ${price} | processTrade: ${Date.now() - t0}ms`);
-            riskManagerStart(tokenId, conditionId, price);
+            console.log(
+                `✅ BUY | ${response.orderID || "N/A"} | ${tokensReceived.toFixed(2)} tokens @ ${buyLegToken.substring(0, 12)}... | processTrade: ${Date.now() - t0}ms`
+            );
+            riskManagerStart(buyLegToken, conditionId, refPrice);
         } else {
             tradesFailed++;
-            if (copySide === "BUY") removeFromBoughtTokenIds(tokenId, sourceWallet);
+            removeFromBoughtTokenIds(buyLegToken, sourceWallet);
         }
     } catch (error) {
         tradesFailed++;
         const msg = error instanceof Error ? error.message : String(error);
         console.log(`❌ ${msg.substring(0, 80)}`);
         logToFile(`FAILED: ${msg}`);
-        if (copySide === "BUY") removeFromBoughtTokenIds(tokenId, sourceWallet);
+        if (tokenForBuy !== null) removeFromBoughtTokenIds(tokenForBuy, sourceWallet);
     } finally {
-        if (copySide === "BUY") tokenIdsBuyInProgress.delete(tokenWalletKey(tokenId, sourceWallet));
+        if (tokenForBuy !== null) tokenIdsBuyInProgress.delete(tokenWalletKey(tokenForBuy, sourceWallet));
+    }
+    } finally {
+        tradeProcessLocks.delete(lockKey);
     }
 }
 
