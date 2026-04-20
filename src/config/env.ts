@@ -125,6 +125,12 @@ export const env = {
         return parseNum(process.env.WALLET_FETCH_DELAY_MS, 800) || 800;
     },
 
+    /** How many activity rows to fetch per wallet per poll (copytrade-api). */
+    get ACTIVITY_FETCH_LIMIT(): number {
+        const n = parseNum(process.env.ACTIVITY_FETCH_LIMIT, 40);
+        return Math.min(100, Math.max(2, n));
+    },
+
     /** BUY slippage in basis points (100 = 1%, 200 = 2%). We pay up to this much above trade price to improve fill. Default 200. */
     get BUY_SLIPPAGE_BPS(): number {
         const v = process.env.BUY_SLIPPAGE_BPS;

@@ -27,6 +27,17 @@ import {
 } from "./copy-trade/core";
 import type { TradeForProcess } from "./copy-trade/core";
 
+/** WS payload may use proxyWallet, wallet, or user — match config.json addresses. */
+function tradeWalletFromPayload(payload: TradePayload): string | undefined {
+    const raw =
+        payload.proxyWallet ??
+        payload.wallet ??
+        payload.user ??
+        payload.userAddress ??
+        payload.address;
+    return raw ? raw.toLowerCase() : undefined;
+}
+
 async function main() {
     logger.info("Starting Polymarket Copy Trade (WebSocket)");
     const enableCopyTrading = env.ENABLE_COPY_TRADING;
@@ -77,9 +88,9 @@ async function main() {
         
         if (message.topic !== "activity" || message.type !== "trades") return;
         const payload = message.payload as TradePayload;
-        
-        const wallet = payload.proxyWallet?.toLowerCase();
-        
+
+        const wallet = tradeWalletFromPayload(payload);
+
         if (!wallet || !(wallet in WALLET_ORDER_SIZE) || WALLET_ORDER_SIZE[wallet] <= 0) return;
         console.log(`[WS] topic=${message.topic} type=${message.type} payload=${JSON.stringify(message.payload)}`);
 
@@ -93,14 +104,19 @@ async function main() {
             outcome: payload.outcome,
             outcomeIndex: payload.outcomeIndex ?? 0,
             price: payload.price ?? 0,
-            proxyWallet: payload.proxyWallet,
+            proxyWallet: payload.proxyWallet ?? payload.wallet ?? payload.user ?? payload.userAddress,
             side: payload.side,
             size: payload.size,
             slug: payload.slug,
             timestamp: payload.timestamp,
             title: payload.title,
             transactionHash: payload.transactionHash,
-            sourceWallet: payload.proxyWallet,
+            sourceWallet:
+                payload.proxyWallet ??
+                payload.wallet ??
+                payload.user ??
+                payload.userAddress ??
+                payload.address,
         };
 
         try {

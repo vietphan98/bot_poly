@@ -20,7 +20,6 @@ import {
     loadProcessedTrades,
     getTargetWallets,
     convertToTradePayload,
-    is5mOr15mCryptoMarket,
     getStats,
     LOG_FILE,
     logToFile,
@@ -33,7 +32,8 @@ const POLL_INTERVAL_MS = env.POLL_INTERVAL_MS;
 
 async function fetchTradesFromWallet(wallet: string): Promise<any[]> {
     try {
-        const apiUrl = `https://data-api.polymarket.com/activity?user=${wallet}&limit=2&offset=0&sortBy=TIMESTAMP&sortDirection=DESC`;
+        const limit = env.ACTIVITY_FETCH_LIMIT;
+        const apiUrl = `https://data-api.polymarket.com/activity?user=${wallet}&limit=${limit}&offset=0&sortBy=TIMESTAMP&sortDirection=DESC`;
         const response = await fetch(apiUrl, { method: "GET", headers: { Accept: "application/json" } });
         if (!response.ok) {
             logToFile(`API ERROR for wallet ${wallet}: ${response.status} ${response.statusText}`);
@@ -84,7 +84,7 @@ async function pollAndProcessTrades() {
                 const trade = convertToTradePayload(item);
                 const side = (trade.side || "").toUpperCase();
                 if (side !== "BUY" && side !== "SELL") continue;
-                if (!is5mOr15mCryptoMarket(trade)) continue;
+                // Let processTrade apply filters + stats; do not drop trades here silently.
                 if (env.DRY_RUN) {
                     console.log(`   [DRY RUN] Would process ${side} | ${trade.title || trade.slug || trade.conditionId?.slice(0, 16)}...`);
                     dashboard.addEvent(`[DRY] ${side} ${trade.title || trade.slug || trade.conditionId?.slice(0, 16)}`);

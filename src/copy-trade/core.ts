@@ -383,9 +383,12 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
     const sourceSide = side as "BUY" | "SELL";
     const copySide = inverseCopySide(sourceSide);
 
+    if (isProcessed(transactionHash, conditionId, tokenId)) return;
+
     if (!is5mOr15mCryptoMarket(trade)) {
         tradesSkipped++;
         logToFile(`SKIPPED: Not 5m/15m crypto market - ${trade.slug || trade.eventSlug || "N/A"}`);
+        markTransactionAsSeen(transactionHash, conditionId, tokenId);
         return;
     }
     if (!sourceWallet || !(sourceWallet.toLowerCase() in WALLET_ORDER_SIZE)) {
@@ -413,11 +416,6 @@ export async function processTrade(trade: TradeForProcess): Promise<void> {
     if (copySide === "BUY" && (configAmount == null || configAmount <= 0)) {
         tradesSkipped++;
         logToFile(`SKIPPED: No order amount for wallet ${sourceWallet}`);
-        return;
-    }
-    if (isProcessed(transactionHash, conditionId, tokenId)) {
-        tradesSkipped++;
-        logToFile(`SKIPPED: Already processed - ${transactionHash.substring(0, 10)}...`);
         return;
     }
     markTransactionAsSeen(transactionHash, conditionId, tokenId);
